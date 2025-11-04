@@ -28,6 +28,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import matplotlib
+matplotlib.use('module://matplotlib_inline.backend_inline')
 import matplotlib.pyplot as plt
 
 # Garante que o diretório de trabalho seja a raiz do projeto
@@ -57,11 +59,11 @@ T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 1      # número de passos do Adam
+adam_steps = 1000   # número de passos do Adam
 lbfgs_steps = 1000  # máximo de iterações do L-BFGS (0 = disabled)
 N_phys = 500        # pontos para a física
 N_ic = 1            # pontos para IC (usaremos t=0)
-N_data = 2          # pontos para dados de treino
+N_data = 4          # pontos para dados de treino
 noise_level = 0     # nível de ruído nos dados (0 = sem ruído)
 
 # Rede neural
@@ -77,6 +79,7 @@ eval_samples = 1000           # pontos para avaliação
 eval_time_range = 1           # intervalo de tempo para avaliação (1 = 100% do tempo de voo)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")
 if deterministic:
     np.random.seed(seed)
     torch.manual_seed(seed)
