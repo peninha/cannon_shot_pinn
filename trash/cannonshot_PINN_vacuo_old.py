@@ -1,5 +1,5 @@
 # %% [markdown]
-# # PINN para balística 2D com arrasto (sem vento) e estimação de Cd
+# # PINN para balística 2D sem arrasto
 #
 # ---
 #
@@ -7,14 +7,11 @@
 #
 # Rede mapeia `t -> s(t) = [x(t), y(t), vx(t), vy(t)]`
 #
-# Usamos autodiff para obter derivadas temporais e impor a física com arrasto quadrático:
+# Usamos autodiff para obter derivadas temporais e impor a física:
 # >  x'  = vx<br>
 # >  y'  = vy<br>
-# >  vx' = -k |v| vx<br>
-# >  vy' = -g - k |v| vy
-#
-# onde  `k = (ρ · Cd · A) / (2 · m)`  e  `|v| = sqrt(vx^2 + vy^2)`.<br>
-# A PINN aprende o estado s(t) e estima o parâmetro Cd.
+# >  vx' = 0<br>
+# >  vy' = -g<br>
 #
 # E condições iniciais (IC) em t=0.
 # >  x(0) = 0<br>
@@ -22,17 +19,7 @@
 # >  vx(0) = v0 \* cos( theta0 )<br>
 # >  vy(0) = v0 \* sin( theta0 )<br>
 #
-# Parâmetros físicos usados:
-# - m: massa do projétil (1 kg)
-# - ρ: densidade do ar (≈ 1.225 kg/m³)
-# - A: área frontal do projétil (A = π (d/2)^2)
-# - d: diâmetro do projétil (0.05 m)
-# - Cd: coeficiente de arrasto (estimado pela PINN)
-#
-# Ground truth:
-# - Gerado por integração numérica da dinâmica com arrasto (sem vento), usando Cd_true
-# - Ao colidir com o solo, fixa y=0 e zera as velocidades a partir do impacto
-#
+
 # %% Importações
 # ====== Importações ======
 import inspect
@@ -56,38 +43,27 @@ os.chdir(PROJECT_ROOT)
 # %% Parâmetros físicos
 # ====== Parâmetros físicos ======
 g = 9.81                         # m/s^2
-v0 = 200.0                        # m/s
-theta0_deg = 18.0               # graus
+v0 = 50.0                        # m/s
+theta0_deg = 63.0                # graus
 theta0 = np.radians(theta0_deg)  # radianos
 y0 = 0.0                         # m
 x0 = 0.0                         # m
 
-# Arrasto (sem vento): massa conhecida e Cd desconhecido (a ser estimado)
-m = 1.0                          # kg - massa do projétil
-rho = 1.225                      # kg/m^3 - densidade do ar
-densidade_chumbo = 11340         # kg/m^3 - densidade do chumbo
-diametro = (6 * m / np.pi / densidade_chumbo) ** (1/3) # m - diâmetro do projétil
-A = np.pi * (diametro / 2) ** 2  # m^2 - área de seção reta do projétil
-
-# Valor "verdadeiro" para gerar dados sintéticos
-Cd_true = 2.0                   # coeficiente de arrasto "verdadeiro"
-
 def shot_flight_time(y0, v0, theta0, g):
-    # tempo de voo total (aprox. vácuo)
     tf = 1/g * (v0*np.sin(theta0) + np.sqrt(v0**2*np.sin(theta0)**2 + 2*g*y0))
     return tf
 
-T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total (aprox. vácuo)
+T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total
 
 # %% Parâmetros de treino
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 2000   # número de passos do Adam
-lbfgs_steps = 2000  # máximo de iterações do L-BFGS (0 = disabled)
-N_phys = 1000       # pontos para a física
+adam_steps = 1000   # número de passos do Adam
+lbfgs_steps = 1000  # máximo de iterações do L-BFGS (0 = disabled)
+N_phys = 500        # pontos para a física
 N_ic = 1            # pontos para IC (usaremos t=0)
-N_data = 2          # pontos para dados de treino
+N_data = 4          # pontos para dados de treino
 noise_level = 0     # nível de ruído nos dados (0 = sem ruído)
 
 # Rede neural
@@ -96,12 +72,11 @@ lambda_phys = 0.8             # peso da perda física
 lambda_data = 1 - lambda_phys # peso da perda dados (inclui IC)
 lambda_dynamic = 0            # taxa de ajuste de lambda_phys (0 = disabled)
 learning_rate = 1e-3          # taxa de aprendizado do Adam
-train_sample_range = 0.6      # porcentagem do tempo de voo (vacuo) para amostrar os pontos de treino
-resample_phys_points = False   # se True, reamostra pontos de física a cada passo
+resample_phys_points = True   # se True, reamostra pontos de física a cada passo
 deterministic = False         # se True, torna o treinamento determinístico
 seed = 42                     # seed para reprodução
 eval_samples = 1000           # pontos para avaliação
-eval_time_range = 0.6           # intervalo de tempo para avaliação (1 = 100% do tempo de voo)
+eval_time_range = 1           # intervalo de tempo para avaliação (1 = 100% do tempo de voo)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")
@@ -117,174 +92,35 @@ resume_from = None
 #resume_from = "vacuo-1_64_64_64_4-3000-500-0-lamb05-resamplephys"
 
 #%% Ground Truth
-# Função de Estado - Ground Truth com arrasto
+# Função de Estado - Ground Truth
 def shot_state_ground_truth(t):
     """
-    Calcula o estado do projétil em tempo t (com arrasto quadrático).
+    Calcula o estado do projétil em tempo t (sem arrasto).
     t pode ser um escalar ou array NumPy.
     Retorna: x, y, vx, vy
     """
-    # Integra ODE com arrasto quadrático: 
-    # dx/dt = vx; dy/dt = vy
-    # dvx/dt = -k_true * |v| * vx; dvy/dt = -g - k_true * |v| * vy
-    # onde k_true = rho * Cd_true * A / (2 m)
-    
     t = np.asarray(t)
-    t_flat = t.flatten()
-    
-    # Ordena tempos e mantém índice para reordenar no final
-    sorted_idx = np.argsort(t_flat)
-    sorted_vals = t_flat[sorted_idx]
-    max_t = float(sorted_vals[-1]) if sorted_vals.size > 0 else 0.0
-    
-    # Passo de integração adaptado
-    dt = float(min(1e-3, max(max_t/5000.0, 1e-4)))
-
-    # Constantes
-    k_true = (rho * Cd_true * A) / (2.0 * m)
     vx0 = v0 * np.cos(theta0)
     vy0 = v0 * np.sin(theta0)
     
-    # Estados escalares para integração
-    x, y = x0, y0
-    vx, vy = vx0, vy0
-    t_curr = 0.0
-    hit_ground = False
-
-    # Função auxiliar para avançar um pequeno passo
-    def step_state(vx_f, vy_f, x_f, y_f, h):
-        speed = (vx_f * vx_f + vy_f * vy_f) ** 0.5
-        ax = -k_true * speed * vx_f
-        ay = -g - k_true * speed * vy_f
-        vx_new = vx_f + h * ax
-        vy_new = vy_f + h * ay
-        x_new = x_f + h * vx_f
-        y_new = y_f + h * vy_f
-        return vx_new, vy_new, x_new, y_new
-
-    # Arrays de saída
-    out_x = np.empty_like(sorted_vals)
-    out_y = np.empty_like(sorted_vals)
-    out_vx = np.empty_like(sorted_vals)
-    out_vy = np.empty_like(sorted_vals)
-
-    j = 0
-    for tau in sorted_vals:
-        tau_f = float(tau)
-        # Avança de t_curr até tau_f
-        while t_curr + 1e-12 < tau_f:
-            h = min(dt, tau_f - t_curr)
-            if not hit_ground:
-                vx, vy, x, y = step_state(vx, vy, x, y, h)
-                if y <= 0.0 and vy < 0.0:
-                    # Colisão com o solo: fixa estado a partir daqui
-                    y = 0.0
-                    vx = 0.0
-                    vy = 0.0
-                    hit_ground = True
-            t_curr += h
-
-        # Registra estado em tau
-        out_x[j] = x
-        out_y[j] = y
-        out_vx[j] = vx
-        out_vy[j] = vy
-        j += 1
-
-    # Reordena ao formato original
-    inv_idx = np.empty_like(sorted_idx)
-    inv_idx[sorted_idx] = np.arange(sorted_idx.size)
-    x_out = out_x[inv_idx].reshape(t.shape)
-    y_out = out_y[inv_idx].reshape(t.shape)
-    vx_out = out_vx[inv_idx].reshape(t.shape)
-    vy_out = out_vy[inv_idx].reshape(t.shape)
-    return x_out, y_out, vx_out, vy_out
-
-# %% Funções utilitárias
-# ====== Funções utilitárias ======
-def grad(outputs, inputs):
-    # gera a derivada de `outputs` em relação a `inputs`
-    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs),
-                               retain_graph=True, create_graph=True)[0]
-
-def amostrar_pontos_fisica():
-    # Gera N_phys pontos aleatórios no intervalo [0, 0.95 * T]
-    t_phys = np.random.rand(N_phys) * train_sample_range * T
-    return t_phys
-
-def amostrar_pontos_dados():
-    # Gera N_data+1 pontos igualmente espaçados no intervalo [0, 0.95 * T] e remove o primeiro (CI t=0)
-    t_data = np.linspace(0, train_sample_range * T, N_data + 1)[1:]
-    return t_data
-
-def ajustar_lambda_dinamico(loss_ic, loss_data, loss_phys, lambda_phys, lambda_dynamic):
-    # Ajusta dinamicamente os pesos lambda_phys e lambda_data baseado nas perdas.
-    if lambda_dynamic == 0:
-        return lambda_phys, 1 - lambda_phys
+    t_clamped = np.minimum(t, T)  # faz projétil colidir com o solo
+    x = x0 + vx0 * t_clamped
+    y = y0 + vy0 * t_clamped - 0.5 * g * (t_clamped ** 2)
     
-    loss_data_val = (loss_ic + loss_data).item()
-    loss_phys_val = loss_phys.item()
+    # Velocidades zero após colisão com o solo
+    vy_air = vy0 - g * t_clamped
+    vx = np.where(t_clamped >= T, 0.0, vx0)
+    vy = np.where(t_clamped >= T, 0.0, vy_air)
     
-    if loss_phys_val > loss_data_val:
-        # Perda física é maior, aumenta lambda_phys
-        lambda_phys = min(1.0, lambda_phys + lambda_dynamic)
-    else:
-        # Perda de dados é maior, diminui lambda_phys
-        lambda_phys = max(0.0, lambda_phys - lambda_dynamic)
-    
-    lambda_data = 1 - lambda_phys
-    return lambda_phys, lambda_data
-
-# %% Amostragem de pontos e geração de dados
-# ====== Amostragem de pontos ======
-default_dtype = torch.get_default_dtype()
+    return x, y, vx, vy
 
 # Constantes em torch (para uso na rede neural)
+default_dtype = torch.get_default_dtype()
 vx0_t = torch.tensor(v0 * np.cos(theta0), device=device, dtype=default_dtype)
 vy0_t = torch.tensor(v0 * np.sin(theta0), device=device, dtype=default_dtype)
 x0_t = torch.tensor(x0, device=device, dtype=default_dtype)
 y0_t = torch.tensor(y0, device=device, dtype=default_dtype)
 g_t = torch.tensor(g, device=device, dtype=default_dtype)
-m_t = torch.tensor(m, device=device, dtype=default_dtype)
-rho_t = torch.tensor(rho, device=device, dtype=default_dtype)
-A_t = torch.tensor(A, device=device, dtype=default_dtype)
-
-# Condição inicial (t=0) - array 1D
-t_ic = np.zeros(N_ic)
-t_ic_torch = torch.tensor(t_ic, device=device, dtype=default_dtype, requires_grad=True).reshape(-1, 1)
-
-# Pontos de amostragem na física no intervalo [0, T]
-t_phys = amostrar_pontos_fisica()
-t_phys_torch = torch.tensor(t_phys, device=device, dtype=default_dtype, requires_grad=True).reshape(-1, 1)
-
-# Pontos de amostragem nos dados no intervalo [0, T]
-if N_data > 0:
-    t_data = amostrar_pontos_dados()
-    # Calcula ground truth
-    x_data_true, y_data_true, vx_data_true, vy_data_true = shot_state_ground_truth(t_data)
-    if noise_level > 0:
-        # Adiciona ruído aos dados de treino
-        x_data_true = x_data_true + noise_level * np.random.randn(*x_data_true.shape)
-        y_data_true = y_data_true + noise_level * np.random.randn(*y_data_true.shape)
-        vx_data_true = vx_data_true + noise_level * np.random.randn(*vx_data_true.shape)
-        vy_data_true = vy_data_true + noise_level * np.random.randn(*vy_data_true.shape)
-    # Converte para torch (reshape para (N, 1) para compatibilidade com saída da rede)
-    t_data_torch = torch.tensor(t_data, device=device, dtype=default_dtype, requires_grad=True).reshape(-1, 1)
-    x_data_true_torch = torch.tensor(x_data_true, device=device, dtype=default_dtype).reshape(-1, 1)
-    y_data_true_torch = torch.tensor(y_data_true, device=device, dtype=default_dtype).reshape(-1, 1)
-    vx_data_true_torch = torch.tensor(vx_data_true, device=device, dtype=default_dtype).reshape(-1, 1)
-    vy_data_true_torch = torch.tensor(vy_data_true, device=device, dtype=default_dtype).reshape(-1, 1)
-else:
-    t_data = None
-    x_data_true = None
-    y_data_true = None
-    vx_data_true = None
-    vy_data_true = None
-    t_data_torch = None
-    x_data_true_torch = None
-    y_data_true_torch = None
-    vx_data_true_torch = None
-    vy_data_true_torch = None
 
 # %% Definição da rede
 # ====== MLP simples com tanh ======
@@ -304,9 +140,6 @@ class PINN(nn.Module):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
 
-        # Parâmetro Cd treinável (mantido positivo via softplus)
-        self.cd_raw = nn.Parameter(torch.tensor(0.3, dtype=default_dtype))
-
     def forward(self, t):
         return self.net(t)
     
@@ -322,16 +155,11 @@ class PINN(nn.Module):
         dvx_dt = grad(vx_phys, t_phys)
         dvy_dt = grad(vy_phys, t_phys)
         
-        # Resíduos da física com arrasto quadrático
-        # k = rho * Cd * A / (2 m)
-        cd_pos = torch.nn.functional.softplus(self.cd_raw) + 1e-8
-        k = (rho_t * cd_pos * A_t) / (2.0 * m_t)
-        v_norm = torch.sqrt(vx_phys.pow(2) + vy_phys.pow(2) + 1e-12)
-
+        # Resíduos da física
         r1 = dx_dt - vx_phys
         r2 = dy_dt - vy_phys
-        r3 = dvx_dt + k * v_norm * vx_phys
-        r4 = dvy_dt + g_t + k * v_norm * vy_phys
+        r3 = dvx_dt
+        r4 = dvy_dt + g_t
         
         loss_phys = (r1.pow(2).mean() + r2.pow(2).mean() + r3.pow(2).mean() + r4.pow(2).mean())
         
@@ -358,6 +186,68 @@ class PINN(nn.Module):
         return loss, loss_ic, loss_data, loss_phys
 
 model = PINN(layers).to(device)
+
+# %% Funções utilitárias
+# ====== Funções utilitárias ======
+def grad(outputs, inputs):
+    # gera a derivada de `outputs` em relação a `inputs`
+    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs),
+                               retain_graph=True, create_graph=True)[0]
+
+def amostrar_pontos_fisica():
+    # Gera N_phys pontos aleatórios no intervalo [0, 0.95 * T]
+    t_phys = np.random.rand(N_phys, 1) * 0.95 * T
+    return t_phys
+
+def amostrar_pontos_dados():
+    # Gera N_data+1 pontos igualmente espaçados no intervalo [0, 0.95 * T] e remove o primeiro (CI t=0)
+    t_data = np.linspace(0, 0.95 * T, N_data + 1)[1:].reshape(-1, 1)  # Remove o primeiro ponto
+    return t_data
+
+# %% Amostragem de pontos e geração de dados
+# ====== Amostragem de pontos ======
+# Pontos de amostragem na física no intervalo [0, T]
+t_phys = amostrar_pontos_fisica()
+
+# Ponto de condição inicial (t=0)
+t_ic = np.zeros((N_ic, 1))
+
+# Pontos de amostragem nos dados no intervalo [0, T]
+if N_data > 0:
+    t_data = amostrar_pontos_dados()
+    # Calcula ground truth em NumPy
+    x_data_true, y_data_true, vx_data_true, vy_data_true = shot_state_ground_truth(t_data)
+    
+    if noise_level > 0:
+        # Adiciona ruído aos dados de treino (em NumPy)
+        x_data_true = x_data_true + noise_level * np.random.randn(*x_data_true.shape)
+        y_data_true = y_data_true + noise_level * np.random.randn(*y_data_true.shape)
+        vx_data_true = vx_data_true + noise_level * np.random.randn(*vx_data_true.shape)
+        vy_data_true = vy_data_true + noise_level * np.random.randn(*vy_data_true.shape)
+else:
+    t_data = None
+    x_data_true = None
+    y_data_true = None
+    vx_data_true = None
+    vy_data_true = None
+
+# ====== Conversão para Torch (uma única vez) ======
+# Condição inicial
+t_ic_torch = torch.tensor(t_ic, device=device, dtype=default_dtype, requires_grad=True)
+
+# Dados de treino
+if N_data > 0:
+    t_data_torch = torch.tensor(t_data, device=device, dtype=default_dtype, requires_grad=True)
+    x_data_true_torch = torch.tensor(x_data_true, device=device, dtype=default_dtype)
+    y_data_true_torch = torch.tensor(y_data_true, device=device, dtype=default_dtype)
+    vx_data_true_torch = torch.tensor(vx_data_true, device=device, dtype=default_dtype)
+    vy_data_true_torch = torch.tensor(vy_data_true, device=device, dtype=default_dtype)
+else:
+    t_data_torch = None
+    x_data_true_torch = None
+    y_data_true_torch = None
+    vx_data_true_torch = None
+    vy_data_true_torch = None
 
 # %% Otimizadores
 # ====== Otimizadores ======
@@ -423,9 +313,11 @@ for step in range(previous_steps, total_steps):
 
     if resample_phys_points:
         t_phys = amostrar_pontos_fisica()
-        t_phys_torch = torch.tensor(t_phys, device=device, dtype=default_dtype, requires_grad=True).reshape(-1, 1)
+    
+    # Converte t_phys para torch (reamostrado ou não)
+    t_phys_torch = torch.tensor(t_phys, device=device, dtype=default_dtype, requires_grad=True)
 
-    # Calcula perda usando método do modelo
+    # Calcula perda usando método do modelo (usa versões _torch)
     loss, loss_ic, loss_data, loss_phys = model.compute_loss(
         t_phys_torch, t_ic_torch, t_data_torch, lambda_phys, lambda_data,
         x_data_true_torch, y_data_true_torch, vx_data_true_torch, vy_data_true_torch
@@ -438,9 +330,18 @@ for step in range(previous_steps, total_steps):
     loss_phys_history.append(loss_phys.item())
     
     # Ajuste dinâmico de lambda
-    lambda_phys, lambda_data = ajustar_lambda_dinamico(
-        loss_ic, loss_data, loss_phys, lambda_phys, lambda_dynamic
-    )
+    if lambda_dynamic != 0:
+        loss_data_val = (loss_ic + loss_data).item()
+        loss_phys_val = loss_phys.item()
+        
+        if loss_phys_val > loss_data_val:
+            # Perda física é maior, aumenta lambda_phys
+            lambda_phys = min(1.0, lambda_phys + lambda_dynamic)
+        else:
+            # Perda de dados é maior, diminui lambda_phys
+            lambda_phys = max(0.0, lambda_phys - lambda_dynamic)
+        
+        lambda_data = 1 - lambda_phys
     
     # Rastreia melhor modelo
     if loss.item() < best_loss:
@@ -449,8 +350,7 @@ for step in range(previous_steps, total_steps):
         best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
 
     if step % 500 == 0:
-        cd_est = (torch.nn.functional.softplus(model.cd_raw) + 1e-8).item()
-        print(f"[Adam] step={step:04d}  loss={loss.item():.6e}  L_data={(loss_ic + loss_data).item():.3e}  L_phys={loss_phys.item():.3e}  λ_phys={lambda_phys:.3f}  Cd={cd_est:.4f}")
+        print(f"[Adam] step={step:04d}  loss={loss.item():.6e}  L_data={(loss_ic + loss_data).item():.3e}  L_phys={loss_phys.item():.3e}  λ_phys={lambda_phys:.3f}")
 
 # %% (Opcional) Refinamento com L-BFGS
 # ====== (Opcional) Refinamento com L-BFGS ======
@@ -466,21 +366,10 @@ if lbfgs_steps > 0:
     lbfgs_iter = [0]  # Contador de iterações
     best_tracking = {'loss': best_loss, 'step': best_step, 'state': best_model_state}
     
-    # Variáveis mutáveis para usar dentro do closure
-    lambda_phys = lambda_phys_initial  # valor inicial para o L-BFGS iniciar com estabilidade
-    lambda_data = 1 - lambda_phys
-    lambda_vars = {'phys': lambda_phys, 'data': lambda_data}
-    t_phys_lbfgs = {'numpy': t_phys, 'torch': t_phys_torch}
-    
     def closure():
         lbfgs.zero_grad()
-        
-        # Nota: Não reamostramos pontos no L-BFGS para manter estabilidade.
-        # L-BFGS é quasi-Newton e assume função objetivo fixa.
-        
         loss, loss_ic, loss_data, loss_phys = model.compute_loss(
-            t_phys_lbfgs['torch'], t_ic_torch, t_data_torch, 
-            lambda_vars['phys'], lambda_vars['data'],
+            t_phys_torch, t_ic_torch, t_data_torch, lambda_phys, lambda_data,
             x_data_true_torch, y_data_true_torch, vx_data_true_torch, vy_data_true_torch
         )
         loss.backward()
@@ -490,14 +379,8 @@ if lbfgs_steps > 0:
         lbfgs_phys_losses.append(loss_phys.item())
         lbfgs_iter[0] += 1
         
-        # Ajuste dinâmico de lambda
-        lambda_vars['phys'], lambda_vars['data'] = ajustar_lambda_dinamico(
-            loss_ic, loss_data, loss_phys, lambda_vars['phys'], lambda_dynamic
-        )
-        
         if lbfgs_iter[0] % 100 == 0 or lbfgs_iter[0] == 1:
-            cd_est = (torch.nn.functional.softplus(model.cd_raw) + 1e-8).item()
-            print(f"[L-BFGS] iter={lbfgs_iter[0]:03d}  loss={loss.item():.6e}  L_data={(loss_ic + loss_data).item():.3e}  L_phys={loss_phys.item():.3e}  λ_phys={lambda_vars['phys']:.3f}  Cd={cd_est:.4f}")
+            print(f"[L-BFGS] iter={lbfgs_iter[0]:03d}  loss={loss.item():.6e}  L_data={(loss_ic + loss_data).item():.3e}  L_phys={loss_phys.item():.3e}")
         
         # Rastreia melhor modelo durante L-BFGS
         if loss.item() < best_tracking['loss']:
@@ -513,10 +396,6 @@ if lbfgs_steps > 0:
     best_loss = best_tracking['loss']
     best_step = best_tracking['step']
     best_model_state = best_tracking['state']
-    
-    # Atualiza lambda com valor final do L-BFGS
-    lambda_phys = lambda_vars['phys']
-    lambda_data = lambda_vars['data']
     
     print(f"L-BFGS finalizado após {lbfgs_iter[0]} iterações")
     print(f"Loss final L-BFGS: {lbfgs_losses[-1]:.6e}\n")
@@ -535,7 +414,7 @@ if lambda_str == "":
 
 last_step = step if step >= 0 else -1
 name_parts = [
-    f"arrasto-{layer_str}",
+    f"vacuo-{layer_str}",
     str(last_step + 1),  # total de passos completados
     str(N_phys),
     str(N_data),
@@ -576,11 +455,6 @@ checkpoint_payload = {
         "lbfgs_steps": lbfgs_steps,
         "resample_phys_points": resample_phys_points,
         "noise_level": noise_level,
-        "m": m,
-        "rho": rho,
-        "A": A,
-        "Cd_true": Cd_true,
-        "cd_estimate": float((torch.nn.functional.softplus(model.cd_raw) + 1e-8).detach().cpu().item()),
     },
 }
 
@@ -595,11 +469,6 @@ if lambda_dynamic != 0:
 
 print("\nTreino finalizado.")
 
-# Mostra Cd estimado
-with torch.no_grad():
-    cd_est = (torch.nn.functional.softplus(model.cd_raw) + 1e-8).item()
-print(f"Cd estimado: {cd_est:.4f} (Cd verdadeiro usado para dados: {Cd_true:.4f})")
-
 # %% Carregamento do melhor modelo para avaliação
 # ====== Usar melhor modelo ======
 if best_model_state is not None:
@@ -612,15 +481,15 @@ else:
 
 # %% Avaliação
 # ====== Avaliação ======
-# Gera pontos de avaliação
-t_eval = np.linspace(0, eval_time_range * T, eval_samples)
+# Gera pontos de avaliação (NumPy)
+t_eval = np.linspace(0, eval_time_range * T, eval_samples).reshape(-1, 1)
 
-# Calcula ground truth
+# Calcula ground truth em NumPy
 x_true, y_true, vx_true, vy_true = shot_state_ground_truth(t_eval)
 
 # Converte para torch e avalia modelo
 with torch.no_grad():
-    t_eval_torch = torch.tensor(t_eval, device=device, dtype=default_dtype).reshape(-1, 1)
+    t_eval_torch = torch.tensor(t_eval, device=device, dtype=default_dtype)
     pred = model(t_eval_torch)
     x_pred, y_pred, vx_pred, vy_pred = pred[:,0:1], pred[:,1:2], pred[:,2:3], pred[:,3:4]
     
@@ -641,15 +510,20 @@ print(
 
 # %% Visualizações
 # ====== Visualizações ======
-# Obtém Cd estimado para os gráficos
+# Obter predições da rede para visualização
 with torch.no_grad():
-    cd_est_final = (torch.nn.functional.softplus(model.cd_raw) + 1e-8).item()
+    pred_eval = model(t_eval_torch)
+    x_pred_eval = pred_eval[:,0].cpu().numpy().flatten()
+    y_pred_eval = pred_eval[:,1].cpu().numpy().flatten()
+    vx_pred_eval = pred_eval[:,2].cpu().numpy().flatten()
+    vy_pred_eval = pred_eval[:,3].cpu().numpy().flatten()
 
-# Converte predições para NumPy
-x_pred = x_pred.cpu().numpy().flatten()
-y_pred = y_pred.cpu().numpy().flatten()
-vx_pred = vx_pred.cpu().numpy().flatten()
-vy_pred = vy_pred.cpu().numpy().flatten()
+# Ground truth já foi calculado (usa variáveis NumPy)
+x_true_eval = x_true.flatten()
+y_true_eval = y_true.flatten()
+vx_true_eval = vx_true.flatten()
+vy_true_eval = vy_true.flatten()
+t_eval_flat = t_eval.flatten()
 
 steps = np.arange(previous_steps + 1, previous_steps + len(loss_history) + 1)
 
@@ -684,11 +558,11 @@ plt.close()
 
 # Gráfico de trajetória com vetores de velocidade
 arrow_stride = max(1, eval_samples // 40)
-arrow_idx = np.arange(0, len(x_pred), arrow_stride)
-vx_arrows = vx_pred[arrow_idx]
-vy_arrows = vy_pred[arrow_idx]
-vx_true_arrows = vx_true[arrow_idx]
-vy_true_arrows = vy_true[arrow_idx]
+arrow_idx = np.arange(0, len(x_pred_eval), arrow_stride)
+vx_arrows = vx_pred_eval[arrow_idx]
+vy_arrows = vy_pred_eval[arrow_idx]
+vx_true_arrows = vx_true_eval[arrow_idx]
+vy_true_arrows = vy_true_eval[arrow_idx]
 
 speed_pred = np.sqrt(vx_arrows**2 + vy_arrows**2)
 speed_true = np.sqrt(vx_true_arrows**2 + vy_true_arrows**2)
@@ -700,18 +574,28 @@ vy_scaled = vy_arrows / scale_factor
 vx_true_scaled = vx_true_arrows / scale_factor
 vy_true_scaled = vy_true_arrows / scale_factor
 
-# Obtém ponto da condição inicial
+# Obtém pontos de dados para visualização (usa dados reais com ruído, se aplicado)
+# Variáveis já estão em NumPy, apenas flatten se necessário
+if N_data > 0 and t_data is not None:
+    x_data_flat = x_data_true.flatten()
+    y_data_flat = y_data_true.flatten()
+    t_data_flat = t_data.flatten()
+    vx_data_flat = vx_data_true.flatten()
+    vy_data_flat = vy_data_true.flatten()
+
+# Obtém ponto da condição inicial (já em NumPy)
 x_ic, y_ic, vx_ic, vy_ic = shot_state_ground_truth(t_ic)
+t_ic_flat = t_ic.flatten()
 
 plt.figure(figsize=(7, 5))
-plt.plot(x_pred, y_pred, label=" PINN", linestyle="--", color="blue")
-plt.plot(x_true, y_true, label="Ground truth", color="orange")
+plt.plot(x_pred_eval, y_pred_eval, label=" PINN", linestyle="--", color="blue")
+plt.plot(x_true_eval, y_true_eval, label="Ground truth", color="orange")
 plt.scatter(x_ic, y_ic, c='tab:green', s=100, zorder=6, marker='*', label="Condição inicial", edgecolors='black', linewidths=0.8)
 if N_data > 0 and t_data is not None:
-    plt.scatter(x_data_true, y_data_true, c='tab:green', s=50, zorder=5, label="Dados de treino", edgecolors='black', linewidths=0.5)
+    plt.scatter(x_data_flat, y_data_flat, c='tab:green', s=50, zorder=5, label="Dados de treino", edgecolors='black', linewidths=0.5)
 plt.quiver(
-    x_pred[arrow_idx],
-    y_pred[arrow_idx],
+    x_pred_eval[arrow_idx],
+    y_pred_eval[arrow_idx],
     vx_scaled,
     vy_scaled,
     angles="xy",
@@ -721,8 +605,8 @@ plt.quiver(
     width=0.004,
 )
 plt.quiver(
-    x_true[arrow_idx],
-    y_true[arrow_idx],
+    x_true_eval[arrow_idx],
+    y_true_eval[arrow_idx],
     vx_true_scaled,
     vy_true_scaled,
     angles="xy",
@@ -733,9 +617,8 @@ plt.quiver(
 )
 plt.xlabel("x (m)")
 plt.ylabel("y (m)")
-plt.title(f"Trajetória - Cd estimado: {cd_est_final:.4f} | Cd verdadeiro: {Cd_true:.4f}")
+plt.title("Trajetória")
 plt.legend()
-plt.axis('equal')  # Mesma escala para x e y
 plt.grid(True)
 plt.tight_layout()
 plt.savefig(images_dir / f"{checkpoint_name}_traj.png", dpi=200, bbox_inches="tight")
@@ -744,18 +627,18 @@ plt.close()
 
 # Gráfico de velocidades
 plt.figure(figsize=(7, 5))
-plt.plot(t_eval, vx_pred, label="vx PINN", linestyle="--", color="blue")
-plt.plot(t_eval, vx_true, label="vx GT", color="orange")
-plt.plot(t_eval, vy_pred, label="vy PINN", linestyle="--", color="darkblue")
-plt.plot(t_eval, vy_true, label="vy GT", color="darkgoldenrod")
-plt.scatter(t_ic, vx_ic, c='tab:green', s=100, zorder=6, marker='*', edgecolors='black', linewidths=0.8)
-plt.scatter(t_ic, vy_ic, c='tab:green', s=100, zorder=6, marker='*', label="Condição inicial", edgecolors='black', linewidths=0.8)
+plt.plot(t_eval_flat, vx_pred_eval, label="vx PINN", linestyle="--", color="blue")
+plt.plot(t_eval_flat, vx_true_eval, label="vx GT", color="orange")
+plt.plot(t_eval_flat, vy_pred_eval, label="vy PINN", linestyle="--", color="darkblue")
+plt.plot(t_eval_flat, vy_true_eval, label="vy GT", color="darkgoldenrod")
+plt.scatter(t_ic_flat, vx_ic, c='tab:green', s=100, zorder=6, marker='*', edgecolors='black', linewidths=0.8)
+plt.scatter(t_ic_flat, vy_ic, c='tab:green', s=100, zorder=6, marker='*', label="Condição inicial", edgecolors='black', linewidths=0.8)
 if N_data > 0 and t_data is not None:
-    plt.scatter(t_data, vx_data_true, c='tab:green', s=50, zorder=5, marker='o', edgecolors='black', linewidths=0.5, label="Dados de treino vx")
-    plt.scatter(t_data, vy_data_true, c='tab:green', s=50, zorder=5, marker='o', edgecolors='black', linewidths=0.5, label="Dados de treino vy")
+    plt.scatter(t_data_flat, vx_data_flat, c='tab:green', s=50, zorder=5, marker='o', edgecolors='black', linewidths=0.5, label="Dados de treino vx")
+    plt.scatter(t_data_flat, vy_data_flat, c='tab:green', s=50, zorder=5, marker='o', edgecolors='black', linewidths=0.5, label="Dados de treino vy")
 plt.xlabel("t (s)")
 plt.ylabel("Velocidade (m/s)")
-plt.title(f"Velocidades - Cd estimado: {cd_est_final:.4f} | Cd verdadeiro: {Cd_true:.4f}")
+plt.title("Velocidades")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
