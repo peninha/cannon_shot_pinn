@@ -59,7 +59,7 @@ T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 1000   # número de passos do Adam
+adam_steps = 5000   # número de passos do Adam
 lbfgs_steps = 1000  # máximo de iterações do L-BFGS (0 = disabled)
 N_phys = 500        # pontos para a física
 N_ic = 1            # pontos para IC (usaremos t=0)
@@ -70,7 +70,7 @@ noise_level = 0     # nível de ruído nos dados (0 = sem ruído)
 layers = [1, 20, 20, 20, 4]   # PINN: 1D (t) -> 4D (x,y,vx,vy)
 lambda_phys = 0.8             # peso da perda física
 lambda_data = 1 - lambda_phys # peso da perda dados (inclui IC)
-lambda_dynamic = 0.001        # taxa de ajuste de lambda_phys (0 = disabled)
+lambda_dynamic = 0            # taxa de ajuste de lambda_phys (0 = disabled)
 learning_rate = 1e-3          # taxa de aprendizado do Adam
 resample_phys_points = True   # se True, reamostra pontos de física a cada passo
 deterministic = False         # se True, torna o treinamento determinístico
