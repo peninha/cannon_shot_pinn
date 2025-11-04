@@ -23,13 +23,14 @@
 # >  vy(0) = v0 \* sin( theta0 )<br>
 #
 # Parâmetros físicos usados:
-# - m: massa do projétil (kg)
+# - m: massa do projétil (1 kg)
 # - ρ: densidade do ar (≈ 1.225 kg/m³)
 # - A: área frontal do projétil (A = π (d/2)^2)
+# - d: diâmetro do projétil (0.05 m)
 # - Cd: coeficiente de arrasto (estimado pela PINN)
 #
 # Ground truth:
-# - Gerado por integração numérica da dinâmica com arrasto (sem vento), usando cd_true
+# - Gerado por integração numérica da dinâmica com arrasto (sem vento), usando Cd_true
 # - Ao colidir com o solo, fixa y=0 e zera as velocidades a partir do impacto
 #
 # %% Importações
@@ -52,37 +53,39 @@ os.chdir(PROJECT_ROOT)
 
 # %% Parâmetros físicos
 # ====== Parâmetros físicos ======
-g = 9.81  # m/s^2
-v0 = 50.0  # m/s
-theta0_deg = 63.0
-theta0 = np.radians(theta0_deg)
-y0 = 0.0
-x0 = 0.0
+g = 9.81                         # m/s^2
+v0 = 50.0                        # m/s
+theta0_deg = 63.0                # graus
+theta0 = np.radians(theta0_deg)  # radianos
+y0 = 0.0                         # m
+x0 = 0.0                         # m
 
 # Arrasto (sem vento): massa conhecida e Cd desconhecido (a ser estimado)
-m = 1.0          # kg
-rho = 1.225      # kg/m^3
-diametro = 0.05  # m (diâmetro do projétil, usado para área de seção reta)
-A = np.pi * (diametro * 0.5) ** 2  # m^2
+m = 1.0                          # kg - massa do projétil
+rho = 1.225                      # kg/m^3 - densidade do ar
+densidade_chumbo = 11340         # kg/m^3 - densidade do chumbo
+diametro = (6 * m / np.pi / densidade_chumbo) ** (1/3) # m - diâmetro do projétil
+A = np.pi * (diametro / 2) ** 2  # m^2 - área de seção reta do projétil
 
-# Valor "verdadeiro" para gerar dados sintéticos (pode ser ajustado)
-cd_true = 0.47
+# Valor "verdadeiro" para gerar dados sintéticos
+Cd_true = 0.47                   # coeficiente de arrasto "verdadeiro"
 
 def shot_flight_time(y0, v0, theta0, g):
+    # tempo de voo total (aprox. vácuo)
     tf = 1/g * (v0*np.sin(theta0) + np.sqrt(v0**2*np.sin(theta0)**2 + 2*g*y0))
     return tf
 
-T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total (aprox. vácuo, usado p/ intervalos de tempo)
+T = shot_flight_time(y0, v0, theta0, g) # tempo de voo total (aprox. vácuo)
 
 # %% Parâmetros de treino
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 1      # número de passos do Adam
+adam_steps = 1000   # número de passos do Adam
 lbfgs_steps = 1000  # máximo de iterações do L-BFGS (0 = disabled)
 N_phys = 500        # pontos para a física
 N_ic = 1            # pontos para IC (usaremos t=0)
-N_data = 2          # pontos para dados de treino
+N_data = 4          # pontos para dados de treino
 noise_level = 0     # nível de ruído nos dados (0 = sem ruído)
 
 # Rede neural
@@ -123,14 +126,14 @@ T_t = torch.tensor(T, device=device, dtype=default_dtype)
 m_t = torch.tensor(m, device=device, dtype=default_dtype)
 rho_t = torch.tensor(rho, device=device, dtype=default_dtype)
 A_t = torch.tensor(A, device=device, dtype=default_dtype)
-cd_true_t = torch.tensor(cd_true, device=device, dtype=default_dtype)
+Cd_true_t = torch.tensor(Cd_true, device=device, dtype=default_dtype)
 
 # Função de Estado - Ground Truth com arrasto (integração numérica simples)
 def shot_state_ground_truth_torch(t):
     # Integra ODE com arrasto quadrático: 
     # dx/dt = vx; dy/dt = vy
     # dvx/dt = -k_true * |v| * vx; dvy/dt = -g - k_true * |v| * vy
-    # onde k_true = rho * cd_true * A / (2 m)
+    # onde k_true = rho * Cd_true * A / (2 m)
     with torch.no_grad():
         t_flat = t.reshape(-1)
         # Ordena tempos e mantém índice para reordenar no final
@@ -140,7 +143,7 @@ def shot_state_ground_truth_torch(t):
         dt_base = max_t / 5000.0 if max_t > 0 else 1e-3
         dt = float(min(0.002, max(1e-4, dt_base)))
 
-        k_true = (rho_t * cd_true_t * A_t) / (2.0 * m_t)
+        k_true = (rho_t * Cd_true_t * A_t) / (2.0 * m_t)
         k_true_f = float(k_true.item())
 
         # Estados escalares para integração
@@ -523,7 +526,7 @@ checkpoint_payload = {
         "m": m,
         "rho": rho,
         "A": A,
-        "cd_true": cd_true,
+        "Cd_true": Cd_true,
         "cd_estimate": float((torch.nn.functional.softplus(model.cd_raw) + 1e-8).detach().cpu().item()),
     },
 }
@@ -542,7 +545,7 @@ print("\nTreino finalizado.")
 # Mostra Cd estimado
 with torch.no_grad():
     cd_est = (torch.nn.functional.softplus(model.cd_raw) + 1e-8).item()
-print(f"Cd estimado: {cd_est:.4f} (Cd verdadeiro usado para dados: {cd_true:.4f})")
+print(f"Cd estimado: {cd_est:.4f} (Cd verdadeiro usado para dados: {Cd_true:.4f})")
 
 # %% Carregamento do melhor modelo para avaliação
 # ====== Usar melhor modelo ======

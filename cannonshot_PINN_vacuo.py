@@ -42,12 +42,12 @@ os.chdir(PROJECT_ROOT)
 
 # %% Parâmetros físicos
 # ====== Parâmetros físicos ======
-g = 9.81  # m/s^2
-v0 = 50.0  # m/s
-theta0_deg = 63.0
-theta0 = np.radians(theta0_deg)
-y0 = 0.0
-x0 = 0.0
+g = 9.81                         # m/s^2
+v0 = 50.0                        # m/s
+theta0_deg = 63.0                # graus
+theta0 = np.radians(theta0_deg)  # radianos
+y0 = 0.0                         # m
+x0 = 0.0                         # m
 
 def shot_flight_time(y0, v0, theta0, g):
     tf = 1/g * (v0*np.sin(theta0) + np.sqrt(v0**2*np.sin(theta0)**2 + 2*g*y0))
