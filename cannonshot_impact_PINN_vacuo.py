@@ -43,14 +43,20 @@ g = 9.81  # m/s^2
 V0_min, V0_max = 10.0, 250.0        # m/s
 theta0_min, theta0_max = 10.0, 80.0  # graus
 
+# Escalas esperadas para outputs (baseadas na física)
+# T_max ≈ 2 * V0_max * sin(theta0_max) / g
+T_scale = 2 * V0_max * np.sin(np.radians(theta0_max)) / g  # ≈ 50s
+# x_max ≈ V0_max² / g (para theta=45°)
+X_scale = V0_max**2 / g  # ≈ 6370m
+
 # %% Parâmetros de treino
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 5000      # número de passos do Adam
-lbfgs_steps = 0     # máximo de iterações do L-BFGS (0 = disabled)
-N_samples = 256        # número de amostras (V0, theta0) por batch
-N_integration = 100    # pontos para integração numérica
+adam_steps = 10000      # número de passos do Adam
+lbfgs_steps = 3000     # máximo de iterações do L-BFGS (0 = disabled)
+N_samples = 512        # número de amostras (V0, theta0) por batch
+N_integration = 1000    # pontos para integração numérica
 
 # Rede neural
 layers = [2, 64, 64, 64, 2]  # PINN: 2D (V0, theta0) -> 2D (T_impact, x_impact)
@@ -59,12 +65,12 @@ deterministic = False        # se True, torna o treinamento determinístico
 seed = 42                    # seed para reprodução
 
 # Pesos das perdas
-lambda_y = 0.05    # peso da perda y (y_impact = 0)
-lambda_x = 0.05    # peso da perda x (x integrado = x_impact)
+lambda_y = 0.45    # peso da perda y (y_impact = 0)
+lambda_x = 0.45    # peso da perda x (x integrado = x_impact)
 lambda_vy = 1 - lambda_y - lambda_x  # peso da perda vy (vy_impact < 0)
 
 # Parâmetro de penalização vy_impact
-epsilon_vy = 1.5   # margem para penalizar vy_impact não negativo (m/s)
+epsilon_vy = 0.5   # margem para penalizar vy_impact não negativo (m/s)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device = torch.device("cpu")
@@ -115,7 +121,8 @@ def normalize_inputs(v0, theta0_rad):
 # %% Definição da rede
 # ====== MLP com integração numérica ======
 class ImpactPINN(nn.Module):
-    def __init__(self, layers, n_integration=100, lambda_y=0.1, lambda_x=0.1, lambda_vy=0.8, epsilon_vy=1.5):
+    def __init__(self, layers, n_integration=100, lambda_y=0.1, lambda_x=0.1, lambda_vy=0.8, 
+                 epsilon_vy=1.5, T_scale=50.0, X_scale=6000.0):
         super().__init__()
         dims = layers
         mods = []
@@ -130,6 +137,8 @@ class ImpactPINN(nn.Module):
         self.lambda_x = lambda_x
         self.lambda_vy = lambda_vy
         self.epsilon_vy = epsilon_vy
+        self.T_scale = T_scale
+        self.X_scale = X_scale
 
         # Inicialização Xavier/Glorot para estabilidade
         for m in self.net:
@@ -142,17 +151,17 @@ class ImpactPINN(nn.Module):
         inputs: tensor de shape (batch, 2) com [v0_norm, theta0_norm]
         Retorna: tensor de shape (batch, 2) com [T_impact, x_impact]
         
-        A rede prediz valores brutos:
-        - aplicamos softplus em T para garantir T_impact > 0.
-        - aplicamos softplus em x para garantir x_impact > 0.
+        A rede prediz valores normalizados [0, 1] que são escalados para os ranges físicos.
+        Usamos sigmoid para garantir outputs em [0, 1], depois escalamos.
         """
         raw = self.net(inputs)
         
-        # T_impact deve ser positivo (usamos softplus para garantir)
-        T_impact = torch.nn.functional.softplus(raw[:, 0:1]) + 0.1  # mínimo de 0.1s
+        # T_impact: sigmoid * T_scale (range: [0, T_scale])
+        # Adicionamos pequeno offset para evitar T=0
+        T_impact = torch.sigmoid(raw[:, 0:1]) * self.T_scale + 0.1
         
-        # x_impact deve ser positivo
-        x_impact = torch.nn.functional.softplus(raw[:, 1:2])
+        # x_impact: sigmoid * X_scale (range: [0, X_scale])
+        x_impact = torch.sigmoid(raw[:, 1:2]) * self.X_scale
         
         return torch.cat([T_impact, x_impact], dim=1)
     
@@ -216,15 +225,17 @@ class ImpactPINN(nn.Module):
             v0, theta0_rad, T_impact
         )
         
-        # Loss 1: y(T_impact) = 0
-        loss_y = (y_integrated ** 2).mean()
+        # Loss 1: y(T_impact) = 0 (normalizado por X_scale²)
+        loss_y = ((y_integrated / self.X_scale) ** 2).mean()
         
-        # Loss 2: x integrado = x_impact predito
-        loss_x = ((x_integrated - x_impact.squeeze(1)) ** 2).mean()
+        # Loss 2: x integrado = x_impact predito (normalizado por X_scale²)
+        loss_x = (((x_integrated - x_impact.squeeze(1)) / self.X_scale) ** 2).mean()
         
         # Loss 3: vy_impact < 0 (penaliza se vy >= 0)
         # Usamos ReLU: max(0, vy_impact + epsilon_vy) para margem de segurança
-        loss_vy = torch.relu(vy_impact + self.epsilon_vy).mean()
+        # Normalizado para escala similar (divide por velocidade típica)
+        v_scale = self.X_scale / self.T_scale  # velocidade típica
+        loss_vy = (torch.relu(vy_impact + self.epsilon_vy) / v_scale).mean()
         
         # Perda total com pesos configuráveis
         loss = self.lambda_y * loss_y + self.lambda_x * loss_x + self.lambda_vy * loss_vy
@@ -235,7 +246,8 @@ class ImpactPINN(nn.Module):
 default_dtype = torch.get_default_dtype()
 g_t = torch.tensor(g, device=device, dtype=default_dtype)
 
-model = ImpactPINN(layers, n_integration=N_integration, lambda_y=lambda_y, lambda_x=lambda_x, lambda_vy=lambda_vy, epsilon_vy=epsilon_vy).to(device)
+model = ImpactPINN(layers, n_integration=N_integration, lambda_y=lambda_y, lambda_x=lambda_x, 
+                   lambda_vy=lambda_vy, epsilon_vy=epsilon_vy, T_scale=T_scale, X_scale=X_scale).to(device)
 
 # %% Otimizadores
 # ====== Otimizadores ======
@@ -416,6 +428,8 @@ checkpoint_payload = {
         "lambda_x": lambda_x,
         "lambda_vy": lambda_vy,
         "epsilon_vy": epsilon_vy,
+        "T_scale": T_scale,
+        "X_scale": X_scale,
     },
 }
 
