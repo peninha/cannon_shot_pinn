@@ -89,7 +89,7 @@ else:
 
 # Use para retomar treinamento de um checkpoint ou None para iniciar do zero
 resume_from = None
-#resume_from = "vacuo-1_64_64_64_4-3000-500-0-lamb05-resamplephys"
+#resume_from = "vacuo-1_20_20_20_4-5000-500-0-lamb08-lbfgs1000-resamplephys-noise2.10"
 
 #%% Ground Truth
 # Função de Estado - Ground Truth
@@ -287,7 +287,7 @@ previous_steps = 0
 if resume_from is not None:
     resume_path = checkpoint_dir / f"{resume_from}.pth"
     if resume_path.exists():
-        checkpoint = torch.load(resume_path, map_location=device)
+        checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         
         # Verifica compatibilidade
         config = checkpoint.get("config", {})
@@ -296,12 +296,17 @@ if resume_from is not None:
             print("Iniciando do zero.")
         else:
             model.load_state_dict(checkpoint["model_state"])
-            adam.load_state_dict(checkpoint["optimizer_state"])
-            previous_steps = checkpoint.get("step", -1) + 1
+            if "optimizer_state" in checkpoint:
+                adam.load_state_dict(checkpoint["optimizer_state"])
+            previous_steps = int(checkpoint.get("step", -1)) + 1
             # Carrega rastreamento do melhor modelo
-            best_loss = checkpoint.get("best_loss", float('inf'))
+            best_loss = float(checkpoint.get("best_loss", float('inf')))
             best_model_state = checkpoint.get("best_model_state", None)
-            best_step = checkpoint.get("best_step", -1)
+            best_step_raw = checkpoint.get("best_step", -1)
+            try:
+                best_step = int(best_step_raw) if best_step_raw is not None else -1
+            except (ValueError, TypeError):
+                best_step = -1  # Formato antigo (ex: "LBFGS-1098"), ignora
             print(f"Checkpoint carregado: {resume_from}")
             print(f"Passos anteriores: {previous_steps}")
             if best_step >= 0:

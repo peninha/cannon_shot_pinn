@@ -1,13 +1,17 @@
 # %% [markdown]
-# # PINN para encontrar ponto de impacto de tiro de canhão no vácuo
+# # PINN para encontrar ponto de impacto de tiro de canhão com arrasto
 #
 # ---
 #
 # Rede mapeia `(V0, theta0) -> (T_impact, x_impact)`
 #
-# Usamos integração numérica (trapézio) para impor a física:
-# >  x = ∫₀^T vx dt = ∫₀^T v0*cos(θ) dt<br>
-# >  y = ∫₀^T vy dt = ∫₀^T (v0*sin(θ) - g*t) dt<br>
+# Usamos integração numérica (Euler) para impor a física com arrasto:
+# >  vx' = -k |v| vx<br>
+# >  vy' = -g - k |v| vy<br>
+# >  x = ∫₀^T vx dt<br>
+# >  y = ∫₀^T vy dt<br>
+#
+# onde `k = (ρ · Cd · A) / (2 · m)` e `|v| = sqrt(vx² + vy²)`
 #
 # Contornos:
 # >  y(T_impact) = 0  (projétil atinge o solo)<br>
@@ -43,20 +47,30 @@ g = 9.81  # m/s^2
 V0_min, V0_max = 10.0, 250.0        # m/s
 theta0_min, theta0_max = 10.0, 80.0  # graus
 
-# Escalas esperadas para outputs (baseadas na física)
-# T_max ≈ 2 * V0_max * sin(theta0_max) / g
+# Parâmetros de arrasto
+m = 1.0                          # kg - massa do projétil
+rho = 1.225                      # kg/m^3 - densidade do ar
+densidade_chumbo = 11340         # kg/m^3 - densidade do chumbo
+diametro = (6 * m / np.pi / densidade_chumbo) ** (1/3)  # m - diâmetro do projétil
+A = np.pi * (diametro / 2) ** 2  # m^2 - área de seção reta do projétil
+Cd = 0.47                        # coeficiente de arrasto (esfera)
+
+# Constante de arrasto k = (rho * Cd * A) / (2 * m)
+k_drag = (rho * Cd * A) / (2 * m)
+
+# Escalas esperadas para outputs (baseadas na física - aproximação vácuo)
+# Com arrasto, os valores serão menores, mas usamos vácuo como limite superior
 T_scale = 2 * V0_max * np.sin(np.radians(theta0_max)) / g  # ≈ 50s
-# x_max ≈ V0_max² / g (para theta=45°)
 X_scale = V0_max**2 / g  # ≈ 6370m
 
 # %% Parâmetros de treino
 # ====== Parâmetros de treino ======
 
 # Pontos de amostragem
-adam_steps = 10000      # número de passos do Adam
+adam_steps = 5000     # número de passos do Adam
 lbfgs_steps = 3000     # máximo de iterações do L-BFGS (0 = disabled)
-N_samples = 512        # número de amostras (V0, theta0) por batch
-N_integration = 100    # pontos para integração numérica
+N_samples = 256        # número de amostras (V0, theta0) por batch (menor pois Euler é mais lento)
+N_integration = 1000    # pontos para integração Euler (100 é suficiente, mais = mais lento)
 
 # Rede neural
 layers = [2, 64, 64, 64, 2]  # PINN: 2D (V0, theta0) -> 2D (T_impact, x_impact)
@@ -83,27 +97,54 @@ else:
 
 # Use para retomar treinamento de um checkpoint ou None para iniciar do zero
 resume_from = None
-# Exemplo: resume_from = "impact-2_64_64_64_2-10000-nint100-nsamp512-eps0p0-ly0p45-lx0p45-lvy0p1-lbfgs3000"
+resume_from = "impact_arrasto-2_64_64_64_2-20000-nint1000-nsamp256-eps0p0-ly0p45-lx0p45-lvy0p1-Cd0p47-lbfgs3000"
+# Exemplo: resume_from = "impact_arrasto-2_64_64_64_2-10000-nint500-nsamp256-..."
 
-# %% Ground Truth analítico
-# ====== Ground Truth analítico ======
-def impact_ground_truth(v0, theta0_rad):
+# %% Ground Truth numérico
+# ====== Ground Truth numérico (integração com arrasto) ======
+def impact_ground_truth(v0_arr, theta0_rad_arr):
     """
-    Calcula T_impact e x_impact analiticamente (sem arrasto, y0=0).
-    v0: velocidade inicial (m/s)
-    theta0_rad: ângulo em radianos
-    Retorna: T_impact, x_impact
+    Calcula T_impact e x_impact numericamente (com arrasto).
+    v0_arr: array de velocidades iniciais (m/s)
+    theta0_rad_arr: array de ângulos em radianos
+    Retorna: T_impact, x_impact (arrays)
     """
-    v0 = np.asarray(v0)
-    theta0_rad = np.asarray(theta0_rad)
+    v0_arr = np.asarray(v0_arr)
+    theta0_rad_arr = np.asarray(theta0_rad_arr)
     
-    # T_impact = 2 * v0 * sin(theta) / g
-    T_impact = 2 * v0 * np.sin(theta0_rad) / g
+    n_samples = v0_arr.size
+    T_impact = np.zeros(n_samples)
+    x_impact = np.zeros(n_samples)
     
-    # x_impact = v0 * cos(theta) * T_impact = v0^2 * sin(2*theta) / g
-    x_impact = v0 * np.cos(theta0_rad) * T_impact
+    dt = 0.001  # passo de integração
+    max_time = 100.0  # tempo máximo de simulação
     
-    return T_impact, x_impact
+    for i in range(n_samples):
+        v0 = v0_arr.flat[i]
+        theta0 = theta0_rad_arr.flat[i]
+        
+        # Condições iniciais
+        x, y = 0.0, 0.0
+        vx = v0 * np.cos(theta0)
+        vy = v0 * np.sin(theta0)
+        t = 0.0
+        
+        # Integração Euler
+        while y >= 0.0 and t < max_time:
+            speed = np.sqrt(vx**2 + vy**2)
+            ax = -k_drag * speed * vx
+            ay = -g - k_drag * speed * vy
+            
+            vx += ax * dt
+            vy += ay * dt
+            x += vx * dt
+            y += vy * dt
+            t += dt
+        
+        T_impact[i] = t
+        x_impact[i] = x
+    
+    return T_impact.reshape(v0_arr.shape), x_impact.reshape(v0_arr.shape)
 
 # %% Funções utilitárias
 # ====== Funções utilitárias ======
@@ -123,10 +164,10 @@ def normalize_inputs(v0, theta0_rad):
     return v0_norm, theta0_norm
 
 # %% Definição da rede
-# ====== MLP com integração numérica e escala adaptativa ======
+# ====== MLP com integração numérica (Euler para arrasto) e escala adaptativa ======
 class ImpactPINN(nn.Module):
-    def __init__(self, layers, n_integration=100, lambda_y=0.1, lambda_x=0.1, lambda_vy=0.8, 
-                 epsilon_vy=1.5, T_scale=50.0, X_scale=6000.0,
+    def __init__(self, layers, n_integration=100, lambda_y=0.45, lambda_x=0.45, lambda_vy=0.1, 
+                 epsilon_vy=0.5, T_scale=50.0, X_scale=6000.0, k_drag=0.0,
                  V0_min=10.0, V0_max=250.0, theta0_min_rad=0.174, theta0_max_rad=1.396):
         super().__init__()
         dims = layers
@@ -138,6 +179,7 @@ class ImpactPINN(nn.Module):
         
         self.n_integration = n_integration
         self.g = g
+        self.k_drag = k_drag
         self.lambda_y = lambda_y
         self.lambda_x = lambda_x
         self.lambda_vy = lambda_vy
@@ -163,7 +205,7 @@ class ImpactPINN(nn.Module):
         Retorna: tensor de shape (batch, 2) com [T_impact, x_impact]
         
         Usa escala adaptativa baseada na física para cada amostra.
-        A rede prediz um fator de ajuste, e a escala é baseada no valor esperado.
+        A rede prediz um fator de ajuste, e a escala é baseada no valor esperado (vácuo como limite superior).
         """
         raw = self.net(inputs)
         
@@ -171,14 +213,13 @@ class ImpactPINN(nn.Module):
         v0 = (inputs[:, 0:1] + 1) / 2 * (self.V0_max - self.V0_min) + self.V0_min
         theta0 = (inputs[:, 1:2] + 1) / 2 * (self.theta0_max_rad - self.theta0_min_rad) + self.theta0_min_rad
         
-        # Escala esperada baseada na física (vácuo)
-        # T_expected = 2 * v0 * sin(theta0) / g
-        # X_expected = v0² * sin(2*theta0) / g
+        # Escala esperada baseada na física (vácuo como limite superior)
+        # Com arrasto, os valores reais serão menores
         T_expected = 2 * v0 * torch.sin(theta0) / self.g
         X_expected = v0**2 * torch.sin(2 * theta0) / self.g
         
         # Rede prediz fator de ajuste: sigmoid dá [0, 1], multiplicamos por 2 para [0, 2x esperado]
-        # Isso garante que a sigmoid sempre opera numa faixa útil
+        # Para arrasto, o valor real será < esperado (vácuo), então [0, 2x] dá margem
         T_impact = torch.sigmoid(raw[:, 0:1]) * 2 * T_expected
         x_impact = torch.sigmoid(raw[:, 1:2]) * 2 * X_expected
         
@@ -186,46 +227,43 @@ class ImpactPINN(nn.Module):
     
     def compute_physics(self, v0, theta0_rad, T_impact):
         """
-        Calcula y_impact e x_integrated usando integração numérica (trapézio).
+        Calcula y_impact e x_integrated usando integração numérica (Euler) com arrasto.
         
         v0: tensor (batch,) - velocidade inicial
         theta0_rad: tensor (batch,) - ângulo em radianos
         T_impact: tensor (batch, 1) - tempo de impacto predito
         
-        Retorna: y_integrated, x_integrated, vy_impact
+        Retorna: y_final, x_final, vy_final
         """
         batch_size = v0.shape[0]
         device = v0.device
         
-        # Gera pontos de tempo para integração: t ∈ [0, T_impact]
-        # Shape: (batch, n_integration)
-        t_normalized = torch.linspace(0, 1, self.n_integration, device=device)
-        t_normalized = t_normalized.unsqueeze(0).expand(batch_size, -1)  # (batch, n_integration)
+        # Condições iniciais
+        vx = v0 * torch.cos(theta0_rad)  # (batch,)
+        vy = v0 * torch.sin(theta0_rad)  # (batch,)
+        x = torch.zeros(batch_size, device=device)
+        y = torch.zeros(batch_size, device=device)
         
-        # t = t_normalized * T_impact para cada amostra
-        t = t_normalized * T_impact  # (batch, n_integration)
+        # Passo de tempo
+        dt = T_impact.squeeze(1) / self.n_integration  # (batch,)
         
-        # Componentes de velocidade inicial
-        vx0 = v0 * torch.cos(theta0_rad)  # (batch,)
-        vy0 = v0 * torch.sin(theta0_rad)  # (batch,)
+        # Integração Euler
+        for _ in range(self.n_integration):
+            speed = torch.sqrt(vx**2 + vy**2 + 1e-8)  # evita divisão por zero
+            
+            # Acelerações com arrasto
+            ax = -self.k_drag * speed * vx
+            ay = -self.g - self.k_drag * speed * vy
+            
+            # Atualiza velocidades
+            vx = vx + ax * dt
+            vy = vy + ay * dt
+            
+            # Atualiza posições
+            x = x + vx * dt
+            y = y + vy * dt
         
-        # Velocidades ao longo do tempo
-        # vx(t) = vx0 (constante no vácuo)
-        # vy(t) = vy0 - g*t
-        vx = vx0.unsqueeze(1).expand(-1, self.n_integration)  # (batch, n_integration)
-        vy = vy0.unsqueeze(1) - self.g * t  # (batch, n_integration)
-        
-        # Integração por trapézio
-        # x = ∫ vx dt
-        x_integrated = torch.trapezoid(vx, t, dim=1)  # (batch,)
-        
-        # y = ∫ vy dt  
-        y_integrated = torch.trapezoid(vy, t, dim=1)  # (batch,)
-        
-        # vy no momento do impacto
-        vy_impact = vy0 - self.g * T_impact.squeeze(1)  # (batch,)
-        
-        return y_integrated, x_integrated, vy_impact
+        return y, x, vy
     
     def compute_loss(self, v0, theta0_rad, outputs):
         """
@@ -239,22 +277,22 @@ class ImpactPINN(nn.Module):
         T_impact = outputs[:, 0:1]  # (batch, 1)
         x_impact = outputs[:, 1:2]  # (batch, 1)
         
-        # Calcula integrais
-        y_integrated, x_integrated, vy_impact = self.compute_physics(
+        # Calcula integrais com arrasto
+        y_final, x_final, vy_final = self.compute_physics(
             v0, theta0_rad, T_impact
         )
         
         # Loss 1: y(T_impact) = 0 (normalizado por X_scale²)
-        loss_y = ((y_integrated / self.X_scale) ** 2).mean()
+        loss_y = ((y_final / self.X_scale) ** 2).mean()
         
         # Loss 2: x integrado = x_impact predito (normalizado por X_scale²)
-        loss_x = (((x_integrated - x_impact.squeeze(1)) / self.X_scale) ** 2).mean()
+        loss_x = (((x_final - x_impact.squeeze(1)) / self.X_scale) ** 2).mean()
         
         # Loss 3: vy_impact < 0 (penaliza se vy >= 0)
-        # Usamos ReLU: max(0, vy_impact + epsilon_vy) para margem de segurança
+        # Usamos ReLU: max(0, vy_final + epsilon_vy) para margem de segurança
         # Normalizado para escala similar (divide por velocidade típica)
         v_scale = self.X_scale / self.T_scale  # velocidade típica
-        loss_vy = (torch.relu(vy_impact + self.epsilon_vy) / v_scale).mean()
+        loss_vy = (torch.relu(vy_final + self.epsilon_vy) / v_scale).mean()
         
         # Perda total com pesos configuráveis
         loss = self.lambda_y * loss_y + self.lambda_x * loss_x + self.lambda_vy * loss_vy
@@ -264,13 +302,15 @@ class ImpactPINN(nn.Module):
 # %% Criação do modelo
 default_dtype = torch.get_default_dtype()
 g_t = torch.tensor(g, device=device, dtype=default_dtype)
+k_drag_t = torch.tensor(k_drag, device=device, dtype=default_dtype)
 
 theta0_min_rad = np.radians(theta0_min)
 theta0_max_rad = np.radians(theta0_max)
 
 model = ImpactPINN(layers, n_integration=N_integration, lambda_y=lambda_y, lambda_x=lambda_x, 
                    lambda_vy=lambda_vy, epsilon_vy=epsilon_vy, T_scale=T_scale, X_scale=X_scale,
-                   V0_min=V0_min, V0_max=V0_max, theta0_min_rad=theta0_min_rad, theta0_max_rad=theta0_max_rad).to(device)
+                   k_drag=k_drag, V0_min=V0_min, V0_max=V0_max, 
+                   theta0_min_rad=theta0_min_rad, theta0_max_rad=theta0_max_rad).to(device)
 
 # %% Otimizadores
 # ====== Otimizadores ======
@@ -290,9 +330,9 @@ if lbfgs_steps > 0:
     lbfgs = torch.optim.LBFGS(model.parameters(), max_iter=lbfgs_steps, line_search_fn='strong_wolfe')
 
 # %% Diretórios
-checkpoint_dir = PROJECT_ROOT / "checkpoints" / "impact_vacuo"
+checkpoint_dir = PROJECT_ROOT / "checkpoints" / "impact_arrasto"
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
-images_dir = PROJECT_ROOT / "imagens" / "impact_vacuo"
+images_dir = PROJECT_ROOT / "imagens" / "impact_arrasto"
 images_dir.mkdir(parents=True, exist_ok=True)
 
 # %% Checagem de checkpoint para retomada
@@ -337,6 +377,7 @@ total_steps = previous_steps + adam_steps
 model.train()
 print("\n" + "="*50)
 print("Iniciando treinamento com Adam...")
+print(f"Parâmetros de arrasto: Cd={Cd}, k={k_drag:.6f}")
 print("="*50)
 
 for step in range(previous_steps, total_steps):
@@ -453,7 +494,7 @@ if lambda_vy_str == "":
     lambda_vy_str = "0"
 
 name_parts = [
-    f"impact-{layer_str}",
+    f"impact_arrasto-{layer_str}",
     str(last_step + 1),
     f"nint{N_integration}",
     f"nsamp{N_samples}",
@@ -461,6 +502,7 @@ name_parts = [
     f"ly{lambda_y_str}",
     f"lx{lambda_x_str}",
     f"lvy{lambda_vy_str}",
+    f"Cd{Cd:.2f}".replace(".", "p"),
 ]
 
 if lbfgs_steps > 0:
@@ -491,6 +533,11 @@ checkpoint_payload = {
         "epsilon_vy": epsilon_vy,
         "T_scale": T_scale,
         "X_scale": X_scale,
+        "Cd": Cd,
+        "k_drag": k_drag,
+        "m": m,
+        "rho": rho,
+        "A": A,
     },
 }
 
@@ -517,15 +564,17 @@ else:
 model.eval()
 
 # Gera grid de avaliação
-n_eval = 50
+n_eval = 30  # menos pontos pois ground truth é lento
 v0_eval = np.linspace(V0_min, V0_max, n_eval)
 theta0_eval_deg = np.linspace(theta0_min, theta0_max, n_eval)
 V0_grid, Theta0_grid_deg = np.meshgrid(v0_eval, theta0_eval_deg)
 V0_flat = V0_grid.flatten()
 Theta0_flat_rad = np.radians(Theta0_grid_deg.flatten())
 
-# Ground truth
+# Ground truth (pode demorar um pouco)
+print("\nCalculando ground truth (pode demorar)...")
 T_true, X_true = impact_ground_truth(V0_flat, Theta0_flat_rad)
+print("Ground truth calculado.")
 
 # Predição
 v0_norm_eval, theta0_norm_eval = normalize_inputs(V0_flat, Theta0_flat_rad)
@@ -547,8 +596,8 @@ print(f"\nRMSE T_impact: {rmse_T:.4e} s")
 print(f"RMSE x_impact: {rmse_X:.4e} m")
 
 # Erro relativo médio
-rel_err_T = np.mean(np.abs(T_pred - T_true) / T_true) * 100
-rel_err_X = np.mean(np.abs(X_pred - X_true) / X_true) * 100
+rel_err_T = np.mean(np.abs(T_pred - T_true) / (T_true + 1e-8)) * 100
+rel_err_X = np.mean(np.abs(X_pred - X_true) / (X_true + 1e-8)) * 100
 print(f"Erro relativo médio T: {rel_err_T:.2f}%")
 print(f"Erro relativo médio X: {rel_err_X:.2f}%")
 
@@ -642,7 +691,7 @@ axes[0, 1].set_xlabel('V0 (m/s)')
 axes[0, 1].set_ylabel('θ0 (graus)')
 plt.colorbar(im2, ax=axes[0, 1], label='s')
 
-T_err = np.abs(T_pred_grid - T_true_grid) / T_true_grid * 100
+T_err = np.abs(T_pred_grid - T_true_grid) / (T_true_grid + 1e-8) * 100
 im3 = axes[0, 2].contourf(V0_grid, Theta0_grid_deg, T_err, levels=20, cmap='Reds')
 axes[0, 2].set_title('Erro relativo T_impact (%)')
 axes[0, 2].set_xlabel('V0 (m/s)')
@@ -662,14 +711,14 @@ axes[1, 1].set_xlabel('V0 (m/s)')
 axes[1, 1].set_ylabel('θ0 (graus)')
 plt.colorbar(im5, ax=axes[1, 1], label='m')
 
-X_err = np.abs(X_pred_grid - X_true_grid) / X_true_grid * 100
+X_err = np.abs(X_pred_grid - X_true_grid) / (X_true_grid + 1e-8) * 100
 im6 = axes[1, 2].contourf(V0_grid, Theta0_grid_deg, X_err, levels=20, cmap='Reds')
 axes[1, 2].set_title('Erro relativo x_impact (%)')
 axes[1, 2].set_xlabel('V0 (m/s)')
 axes[1, 2].set_ylabel('θ0 (graus)')
 plt.colorbar(im6, ax=axes[1, 2], label='%')
 
-plt.suptitle(f'Comparação PINN vs Ground Truth\nRMSE T: {rmse_T:.4f}s | RMSE X: {rmse_X:.4f}m', fontsize=12)
+plt.suptitle(f'Comparação PINN vs Ground Truth (com arrasto, Cd={Cd})\nRMSE T: {rmse_T:.4f}s | RMSE X: {rmse_X:.4f}m', fontsize=12)
 plt.tight_layout()
 plt.savefig(images_dir / f"{checkpoint_name}_comparison.png", dpi=200, bbox_inches="tight")
 plt.show()
