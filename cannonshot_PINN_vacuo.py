@@ -280,8 +280,8 @@ if lbfgs_steps > 0:
 
 # %% Checagem de checkpoint para retomada
 # ====== Carregamento de checkpoint ======
-checkpoint_dir = PROJECT_ROOT / "checkpoints"
-checkpoint_dir.mkdir(exist_ok=True)
+checkpoint_dir = PROJECT_ROOT / "checkpoints" / "traj_vacuo"
+checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 previous_steps = 0
 if resume_from is not None:
@@ -424,8 +424,8 @@ if lbfgs_steps > 0:
 
 # %% Salvamento do checkpoint
 # ====== Checkpoint ======
-images_dir = PROJECT_ROOT / "imagens"
-images_dir.mkdir(exist_ok=True)
+images_dir = PROJECT_ROOT / "imagens" / "traj_vacuo"
+images_dir.mkdir(parents=True, exist_ok=True)
 
 # Constrói nome do checkpoint com passos totais
 layer_str = "_".join(str(n) for n in layers)
