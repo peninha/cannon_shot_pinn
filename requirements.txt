@@ -8,3 +8,5 @@ nbformat>=4.2.0
 ipywidgets>=7.6.0
 jupyter>=1.0.0
 anywidget>=0.1.0
+tabulate>=0.9.0
+torchdiffeq>=0.2.0
