@@ -337,7 +337,7 @@ n_thetas = len(THETAS)
 for i, x_target in enumerate(X_IMPACTS):
     # Seleciona colormap para este alvo
     cmap_name = TARGET_COLORS[i % len(TARGET_COLORS)]
-    cmap = plt.cm.get_cmap(cmap_name)
+    cmap = plt.get_cmap(cmap_name)
     
     # Plota alvo
     ax.scatter([x_target], [0], c=[cmap(0.7)], s=150, marker='o', 
